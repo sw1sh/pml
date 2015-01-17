@@ -1,0 +1,132 @@
+Import the data
+```{r}
+training = read.csv('pml-training.csv')
+testing = read.csv('pml-testing.csv')
+```
+
+Filter out empty columns with only NA in them
+```{r}
+training = training[,colSums(is.na(testing)) != nrow(testing)]
+```
+
+Filter out index, timestamp and window columns, leaving only device related columns
+```{r}
+training = training[,-1][,-(3:7)]
+```
+
+Filter out the same columns from testing data, [,-m] is the "classe" column
+```{r}
+m = ncol(training)
+cols = colnames(training)
+testing = testing[,cols[-m]]
+```
+
+Convert all values to numeric
+```{r}
+training[,-m] = sapply(training[,-m], as.numeric)
+testing = sapply(testing, as.numeric)
+```
+
+Import caret package and configure it to use 4 parallel cores
+```{r message=FALSE, warning = FALSE}
+library(doMC);library(caret);
+registerDoMC(cores = 4)
+```
+
+Train model paramaters, incresse default number of trees
+```{r}
+grid <-  expand.grid(interaction.depth = c(1,5,10), n.trees = (1:50)*10, shrinkage = 0.1)
+```
+
+I use multiclass summary function, found [here](https://gist.github.com/zachmayer/3061272) to be able to use ROC metric with 5 classes
+```{r include = FALSE}
+#Multi-Class Summary Function
+#Based on caret:::twoClassSummary
+require(compiler)
+multiClassSummary <- cmpfun(function (data, lev = NULL, model = NULL){
+  
+  #Load Libraries
+  require(Metrics)
+  require(caret)
+  
+  #Check data
+  if (!all(levels(data[, "pred"]) == levels(data[, "obs"]))) 
+    stop("levels of observed and predicted data do not match")
+  
+  #Calculate custom one-vs-all stats for each class
+  prob_stats <- lapply(levels(data[, "pred"]), function(class){
+    
+    #Grab one-vs-all data for the class
+    pred <- ifelse(data[, "pred"] == class, 1, 0)
+    obs  <- ifelse(data[,  "obs"] == class, 1, 0)
+    prob <- data[,class]
+    
+    #Calculate one-vs-all AUC and logLoss and return
+    cap_prob <- pmin(pmax(prob, .000001), .999999)
+    prob_stats <- c(auc(obs, prob), logLoss(obs, cap_prob))
+    names(prob_stats) <- c('ROC', 'logLoss')
+    return(prob_stats) 
+  })
+  prob_stats <- do.call(rbind, prob_stats)
+  rownames(prob_stats) <- paste('Class:', levels(data[, "pred"]))
+  
+  #Calculate confusion matrix-based statistics
+  CM <- confusionMatrix(data[, "pred"], data[, "obs"])
+  
+  #Aggregate and average class-wise stats
+  #Todo: add weights
+  class_stats <- cbind(CM$byClass, prob_stats)
+  class_stats <- colMeans(class_stats)
+  
+  #Aggregate overall stats
+  overall_stats <- c(CM$overall)
+  
+  #Combine overall with class-wise stats and remove some stats we don't want 
+  stats <- c(overall_stats, class_stats)
+  stats <- stats[! names(stats) %in% c('AccuracyNull', 
+                                       'Prevalence', 'Detection Prevalence')]
+  
+  #Clean names and return
+  names(stats) <- gsub('[[:blank:]]+', '_', names(stats))
+  return(stats)
+  
+})
+```
+
+5-fold cross-validation
+```{r}
+ctrl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+```
+
+Train with principal component preprocessing and gradient boosted model
+```{r cache=TRUE}
+modelFit = train(training[,-m], training$classe, method = "gbm", trControl = ctrl, tuneGrid = grid, metric = "ROC", preProcess = "pca", verbose = FALSE)
+```
+
+Plot learning curves
+```{r}
+trellis.par.set(caretTheme())
+plot(modelFit, metric = "Accuracy")
+```
+
+Use the computed model on traning set and print out confusion matrix
+```{r}
+pred = predict(modelFit, training[,-m])
+confusionMatrix(pred, training$classe)
+```
+
+Predict testing data and make submission files
+```{r}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+```
+
+```{r}
+predict(modelFit, testing)
+pml_write_files(predict(modelFit, testing))
+```
